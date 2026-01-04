@@ -23,6 +23,7 @@ from mcp.types import (
 from .emulator import Emulator, BobbinError
 from .screen import format_screen
 from .encoding import APPLESOFT_TOKENS, detokenize_byte
+from .disktools import DOS33Disk, tokenize_basic
 
 # Global emulator instance
 _emulator: Optional[Emulator] = None
@@ -575,6 +576,91 @@ async def list_tools() -> list[Tool]:
                 }
             }
         ),
+
+        # Disk Image Tools
+        Tool(
+            name="create_disk",
+            description="Create a new DOS 3.3 disk image (.dsk file).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Path for the disk image file"
+                    },
+                    "volume": {
+                        "type": "integer",
+                        "default": 254,
+                        "minimum": 1,
+                        "maximum": 254,
+                        "description": "Volume number (1-254)"
+                    },
+                    "from_template": {
+                        "type": "string",
+                        "description": "Optional: path to DOS 3.3 master disk to copy (for bootable disks)"
+                    }
+                },
+                "required": ["filename"]
+            }
+        ),
+        Tool(
+            name="disk_catalog",
+            description="List files on a DOS 3.3 disk image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Path to the disk image file"
+                    }
+                },
+                "required": ["filename"]
+            }
+        ),
+        Tool(
+            name="save_basic_to_disk",
+            description="Save an Applesoft BASIC program to a disk image. Tokenizes the source automatically.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "disk_filename": {
+                        "type": "string",
+                        "description": "Path to the disk image file"
+                    },
+                    "program_name": {
+                        "type": "string",
+                        "description": "Name for the program on disk (max 30 chars, will be uppercased)"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "BASIC source code with line numbers"
+                    }
+                },
+                "required": ["disk_filename", "program_name", "source"]
+            }
+        ),
+        Tool(
+            name="save_file_to_disk",
+            description="Save a .bas text file to a disk image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "disk_filename": {
+                        "type": "string",
+                        "description": "Path to the disk image file"
+                    },
+                    "bas_filename": {
+                        "type": "string",
+                        "description": "Path to the .bas source file"
+                    },
+                    "program_name": {
+                        "type": "string",
+                        "description": "Optional name for the program on disk (default: derived from filename)"
+                    }
+                },
+                "required": ["disk_filename", "bas_filename"]
+            }
+        ),
     ]
 
 
@@ -1109,6 +1195,67 @@ async def _call_tool_impl(name: str, args: dict[str, Any]) -> str:
             output.append(f"  {t['description']}")
 
         return '\n'.join(output)
+
+    # --- Disk Image Tools ---
+    elif name == "create_disk":
+        filename = args["filename"]
+        volume = args.get("volume", 254)
+        template = args.get("from_template")
+
+        if template:
+            # Copy from template (for bootable disk)
+            import shutil
+            shutil.copy(template, filename)
+            disk = DOS33Disk(filename)
+            return f"Created bootable disk from {template}: {filename}"
+        else:
+            # Create empty formatted disk
+            disk = DOS33Disk()
+            disk.format(volume_num=volume)
+            disk.save(filename)
+            return f"Created blank DOS 3.3 disk: {filename} (Volume {volume})"
+
+    elif name == "disk_catalog":
+        filename = args["filename"]
+        disk = DOS33Disk(filename)
+        files = disk.catalog()
+
+        output = [f"\nDISK VOLUME 254\n"]
+        for f in files:
+            lock = '*' if f['locked'] else ' '
+            output.append(f"{lock}{f['type']} {f['sectors']:03d} {f['name']}")
+        output.append(f"\n{len(files)} FILES")
+
+        return '\n'.join(output)
+
+    elif name == "save_basic_to_disk":
+        disk_filename = args["disk_filename"]
+        program_name = args["program_name"]
+        source = args["source"]
+
+        disk = DOS33Disk(disk_filename)
+        sectors = disk.save_basic_program(program_name, source)
+        disk.save()
+
+        return f"Saved {program_name.upper()} ({sectors} sectors) to {disk_filename}"
+
+    elif name == "save_file_to_disk":
+        disk_filename = args["disk_filename"]
+        bas_filename = args["bas_filename"]
+        program_name = args.get("program_name")
+
+        if not program_name:
+            # Derive from filename
+            program_name = os.path.splitext(os.path.basename(bas_filename))[0]
+
+        with open(bas_filename, 'r') as f:
+            source = f.read()
+
+        disk = DOS33Disk(disk_filename)
+        sectors = disk.save_basic_program(program_name, source)
+        disk.save()
+
+        return f"Saved {program_name.upper()} ({sectors} sectors) from {bas_filename} to {disk_filename}"
 
     else:
         return f"Unknown tool: {name}"
