@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "apple2-mcp"
+version = "0.1.0"
+description = "MCP server for autonomous Apple II experimentation via Bobbin emulator"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "pexpect>=4.9.0",
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+apple2-mcp = "apple2_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/apple2_mcp"]

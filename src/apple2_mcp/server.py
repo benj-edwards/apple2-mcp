@@ -1,0 +1,1184 @@
+"""Apple II MCP Server.
+
+An MCP server for autonomous experimentation with Apple II via Bobbin emulator.
+"""
+
+import asyncio
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any, Optional
+
+from PIL import Image
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import (
+    Tool,
+    TextContent,
+    CallToolResult,
+)
+
+from .emulator import Emulator, BobbinError
+from .screen import format_screen
+from .encoding import APPLESOFT_TOKENS, detokenize_byte
+
+# Global emulator instance
+_emulator: Optional[Emulator] = None
+
+# Path to knowledge base
+KNOWLEDGE_DIR = Path(__file__).parent.parent.parent / "knowledge"
+
+# Create MCP server
+server = Server("apple2-mcp")
+
+
+def get_emulator() -> Emulator:
+    """Get or create the emulator instance."""
+    global _emulator
+    if _emulator is None:
+        _emulator = Emulator()
+    return _emulator
+
+
+def convert_ppm_to_png(ppm_path: str, png_path: str = None) -> str:
+    """Convert a PPM file to PNG format.
+
+    Args:
+        ppm_path: Path to the PPM file
+        png_path: Output PNG path (default: replace .ppm with .png)
+
+    Returns:
+        Path to the PNG file
+    """
+    if png_path is None:
+        png_path = ppm_path.rsplit('.', 1)[0] + '.png'
+
+    img = Image.open(ppm_path)
+    img.save(png_path, 'PNG')
+    os.unlink(ppm_path)  # Remove the temporary PPM
+    return png_path
+
+
+# =============================================================================
+# Tool Definitions
+# =============================================================================
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    """List available tools."""
+    return [
+        # Machine Control
+        Tool(
+            name="boot",
+            description="Start the Apple II emulator. Returns when at BASIC prompt.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "machine": {
+                        "type": "string",
+                        "enum": ["plus", "enhanced"],
+                        "default": "enhanced",
+                        "description": "Machine type (plus=Apple II+, enhanced=Apple //e)"
+                    },
+                    "disk": {
+                        "type": "string",
+                        "description": "Optional path to disk image"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="shutdown",
+            description="Stop the emulator.",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="reset",
+            description="Reset the emulator.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "cold": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Cold reset (full reboot) vs warm reset"
+                    }
+                }
+            }
+        ),
+
+        # Memory Access
+        Tool(
+            name="peek",
+            description="Read bytes from Apple II memory.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 65535,
+                        "description": "Starting address (0-65535)"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "default": 1,
+                        "minimum": 1,
+                        "maximum": 256,
+                        "description": "Number of bytes to read"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["hex", "decimal", "ascii"],
+                        "default": "hex",
+                        "description": "Output format"
+                    }
+                },
+                "required": ["address"]
+            }
+        ),
+        Tool(
+            name="poke",
+            description="Write bytes to Apple II memory.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 65535,
+                        "description": "Starting address"
+                    },
+                    "data": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 0, "maximum": 255},
+                        "description": "Bytes to write"
+                    }
+                },
+                "required": ["address", "data"]
+            }
+        ),
+        Tool(
+            name="load_binary",
+            description="Load binary data into memory from hex string.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "integer",
+                        "description": "Load address"
+                    },
+                    "hex_data": {
+                        "type": "string",
+                        "description": "Binary data as hex string (e.g., 'A9 00 8D 00 C0')"
+                    }
+                },
+                "required": ["address", "hex_data"]
+            }
+        ),
+
+        # Screen/Display
+        Tool(
+            name="read_screen",
+            description="Read the current 40x24 text screen contents.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "annotated": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Include line numbers"
+                    }
+                }
+            }
+        ),
+
+        # Graphics Capture
+        Tool(
+            name="capture_hgr",
+            description="Capture HGR (hi-res graphics) screen. Returns file path. Use 'png' format for Claude to view the image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "default": 1,
+                        "description": "HGR page (1 or 2)"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["png", "ppm", "ascii"],
+                        "default": "png",
+                        "description": "Output format (png=image for Claude, ppm=raw image, ascii=text art)"
+                    },
+                    "color": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Use Apple II color artifacts (ppm only)"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional custom filename (default: auto-generated in /tmp)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="read_hgr_ascii",
+            description="Capture HGR screen as ASCII art and return it directly (no file).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "default": 1,
+                        "description": "HGR page (1 or 2)"
+                    }
+                }
+            }
+        ),
+
+        # GR (Lo-Res) Graphics - 40x48, 16 colors
+        Tool(
+            name="capture_gr",
+            description="Capture GR (lo-res graphics) screen. Returns file path. Use 'png' format for Claude to view the image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "default": 1,
+                        "description": "GR page (1 or 2)"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["png", "ppm", "ascii"],
+                        "default": "png",
+                        "description": "Output format (png=image for Claude, ppm=raw image, ascii=hex digits)"
+                    },
+                    "native": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Save at native 40x48 resolution (default: scaled to 280x192)"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional custom filename (default: auto-generated in /tmp)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="read_gr_ascii",
+            description="Capture GR screen as ASCII art (hex digits 0-F for colors) and return directly.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "default": 1,
+                        "description": "GR page (1 or 2)"
+                    }
+                }
+            }
+        ),
+
+        # DHGR (Double Hi-Res) Graphics - 560x192, //e only
+        Tool(
+            name="capture_dhgr",
+            description="Capture DHGR (double hi-res) screen (560x192, //e with aux memory). Use 'png' for Claude to view.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "default": 1,
+                        "description": "DHGR page (1 or 2)"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["png", "ppm", "ascii"],
+                        "default": "png",
+                        "description": "Output format (png=image for Claude, ppm=raw image, ascii=text art)"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional custom filename (default: auto-generated in /tmp)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="read_dhgr_ascii",
+            description="Capture DHGR screen as ASCII art and return directly (//e with aux memory).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "default": 1,
+                        "description": "DHGR page (1 or 2)"
+                    }
+                }
+            }
+        ),
+
+        # DGR (Double Lo-Res) Graphics - 80x48, 16 colors, //e only
+        Tool(
+            name="capture_dgr",
+            description="Capture DGR (double lo-res) screen (80x48, 16 colors, //e with aux memory). Use 'png' for Claude to view.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "default": 1,
+                        "description": "DGR page (1 or 2)"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["png", "ppm", "ascii"],
+                        "default": "png",
+                        "description": "Output format (png=image for Claude, ppm=raw image, ascii=hex digits)"
+                    },
+                    "native": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Save at native 80x48 resolution (default: scaled to 560x192)"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional custom filename (default: auto-generated in /tmp)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="read_dgr_ascii",
+            description="Capture DGR screen as ASCII art (hex digits 0-F for colors) and return directly.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "default": 1,
+                        "description": "DGR page (1 or 2)"
+                    }
+                }
+            }
+        ),
+
+        # Input
+        Tool(
+            name="type_text",
+            description="Type text into the Apple II as if from keyboard.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to type (will be uppercased)"
+                    },
+                    "press_return": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Press RETURN after text"
+                    }
+                },
+                "required": ["text"]
+            }
+        ),
+        Tool(
+            name="send_key",
+            description="Send a special key.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "enum": ["RETURN", "ESCAPE", "CTRL-C", "CTRL-RESET"],
+                        "description": "Special key to send"
+                    }
+                },
+                "required": ["key"]
+            }
+        ),
+
+        # BASIC/Programs
+        Tool(
+            name="run_basic",
+            description="Execute a BASIC command and wait for prompt.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "BASIC command to execute"
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "default": 30,
+                        "description": "Timeout in seconds"
+                    }
+                },
+                "required": ["command"]
+            }
+        ),
+
+        # Tokenization
+        Tool(
+            name="type_and_capture",
+            description="Type a BASIC line and capture how Apple II tokenizes it.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "basic_line": {
+                        "type": "string",
+                        "description": "BASIC line to type (e.g., '10 FOR I=1 TO 10')"
+                    }
+                },
+                "required": ["basic_line"]
+            }
+        ),
+        Tool(
+            name="tokenize",
+            description="Tokenize BASIC source using Bobbin's built-in tokenizer.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "BASIC source code (with line numbers)"
+                    }
+                },
+                "required": ["source"]
+            }
+        ),
+        Tool(
+            name="compare_tokenization",
+            description="Compare your tokenization against Apple II native tokenization.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "basic_line": {
+                        "type": "string",
+                        "description": "BASIC source line"
+                    },
+                    "your_hex": {
+                        "type": "string",
+                        "description": "Your tokenized output as hex string"
+                    }
+                },
+                "required": ["basic_line", "your_hex"]
+            }
+        ),
+
+        # Injection
+        Tool(
+            name="inject_tokenized_basic",
+            description="Inject pre-tokenized BASIC into memory and update pointers.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hex_data": {
+                        "type": "string",
+                        "description": "Tokenized BASIC as hex string"
+                    },
+                    "load_address": {
+                        "type": "integer",
+                        "default": 2049,
+                        "description": "Load address ($0801 = 2049)"
+                    },
+                    "auto_run": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Automatically RUN after injection"
+                    }
+                },
+                "required": ["hex_data"]
+            }
+        ),
+
+        # Observation
+        Tool(
+            name="get_registers",
+            description="Get current 6502 CPU register state.",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="get_basic_pointers",
+            description="Get Applesoft BASIC memory pointers (TXTTAB, VARTAB, etc.).",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+
+        # Knowledge Base
+        Tool(
+            name="record_technique",
+            description="Save a discovered technique to the knowledge base.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Technique name"
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["injection", "tokenization", "execution", "memory", "other"],
+                        "description": "Category"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What this technique does"
+                    },
+                    "steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Step-by-step instructions"
+                    },
+                    "success": {
+                        "type": "boolean",
+                        "description": "Did this technique work?"
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Additional notes"
+                    }
+                },
+                "required": ["name", "category", "description"]
+            }
+        ),
+        Tool(
+            name="query_techniques",
+            description="Search the knowledge base for techniques.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Filter by category"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Search term"
+                    }
+                }
+            }
+        ),
+    ]
+
+
+# =============================================================================
+# Tool Implementations
+# =============================================================================
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
+    """Handle tool calls."""
+    try:
+        result = await _call_tool_impl(name, arguments)
+        return CallToolResult(content=[TextContent(type="text", text=result)])
+    except Exception as e:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error: {str(e)}")],
+            isError=True
+        )
+
+
+async def _call_tool_impl(name: str, args: dict[str, Any]) -> str:
+    """Implement tool calls."""
+    emu = get_emulator()
+
+    # --- Machine Control ---
+    if name == "boot":
+        machine = args.get("machine", "enhanced")
+        disk = args.get("disk")
+        output = emu.boot(machine=machine, disk=disk)
+        return f"Emulator started ({machine}). Output:\n{output}"
+
+    elif name == "shutdown":
+        emu.shutdown()
+        return "Emulator stopped."
+
+    elif name == "reset":
+        cold = args.get("cold", False)
+        emu.reset(cold=cold)
+        return f"{'Cold' if cold else 'Warm'} reset complete."
+
+    # --- Memory Access ---
+    elif name == "peek":
+        address = args["address"]
+        count = args.get("count", 1)
+        fmt = args.get("format", "hex")
+
+        data = emu.peek(address, count)
+
+        if fmt == "hex":
+            result = ' '.join(f"{b:02X}" for b in data)
+        elif fmt == "decimal":
+            result = ' '.join(str(b) for b in data)
+        else:  # ascii
+            result = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+
+        return f"${address:04X}: {result}"
+
+    elif name == "poke":
+        address = args["address"]
+        data = args["data"]
+        emu.poke(address, data)
+        return f"Wrote {len(data)} bytes at ${address:04X}"
+
+    elif name == "load_binary":
+        address = args["address"]
+        hex_data = args["hex_data"]
+        # Parse hex string
+        data = bytes.fromhex(hex_data.replace(' ', ''))
+        emu.poke(address, list(data))
+        return f"Loaded {len(data)} bytes at ${address:04X}"
+
+    # --- Screen ---
+    elif name == "read_screen":
+        annotated = args.get("annotated", False)
+        lines = emu.read_screen()
+        return format_screen(lines, include_line_numbers=annotated)
+
+    # --- Graphics ---
+    elif name == "capture_hgr":
+        page = args.get("page", 1)
+        fmt = args.get("format", "png")
+        color = args.get("color", False)
+        filename = args.get("filename")
+
+        import time
+        timestamp = int(time.time())
+
+        if fmt == "png":
+            # Capture as PPM first, then convert to PNG
+            ppm_file = f"/tmp/hgr{page}_{timestamp}.ppm"
+            success = emu.capture_hgr(ppm_file, page=page, format="ppm", color=color)
+            if success:
+                if filename:
+                    png_file = filename if filename.endswith('.png') else filename + '.png'
+                else:
+                    png_file = f"/tmp/hgr{page}_{timestamp}.png"
+                filename = convert_ppm_to_png(ppm_file, png_file)
+        else:
+            if not filename:
+                ext = "txt" if fmt == "ascii" else "ppm"
+                filename = f"/tmp/hgr{page}_{timestamp}.{ext}"
+            success = emu.capture_hgr(filename, page=page, format=fmt, color=color)
+
+        if success:
+            result = f"Captured HGR{page} to: {filename}\n"
+            result += f"Format: {fmt}" + (" (color)" if color else " (mono)")
+            result += f"\n\nUse the Read tool to view this file."
+            return result
+        else:
+            return f"Failed to capture HGR{page}"
+
+    elif name == "read_hgr_ascii":
+        page = args.get("page", 1)
+        import tempfile
+
+        # Use temp file
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            filepath = f.name
+
+        success = emu.capture_hgr(filepath, page=page, format="ascii")
+
+        if success:
+            with open(filepath, 'r') as f:
+                ascii_art = f.read()
+            import os
+            os.unlink(filepath)
+            return f"HGR Page {page} (280x192 as ASCII art):\n\n{ascii_art}"
+        else:
+            return f"Failed to capture HGR{page}"
+
+    # --- GR (Lo-Res) Graphics ---
+    elif name == "capture_gr":
+        page = args.get("page", 1)
+        fmt = args.get("format", "png")
+        native = args.get("native", False)
+        filename = args.get("filename")
+
+        import time
+        timestamp = int(time.time())
+        res = "native" if native else "scaled"
+
+        if fmt == "png":
+            # Capture as PPM first, then convert to PNG
+            ppm_file = f"/tmp/gr{page}_{res}_{timestamp}.ppm"
+            success = emu.capture_gr(ppm_file, page=page, format="ppm", native=native)
+            if success:
+                if filename:
+                    png_file = filename if filename.endswith('.png') else filename + '.png'
+                else:
+                    png_file = f"/tmp/gr{page}_{res}_{timestamp}.png"
+                filename = convert_ppm_to_png(ppm_file, png_file)
+        else:
+            if not filename:
+                ext = "txt" if fmt == "ascii" else "ppm"
+                filename = f"/tmp/gr{page}_{res}_{timestamp}.{ext}"
+            success = emu.capture_gr(filename, page=page, format=fmt, native=native)
+
+        if success:
+            if native:
+                result = f"Captured GR{page} to: {filename}\nFormat: {fmt} (40x48 native)"
+            else:
+                result = f"Captured GR{page} to: {filename}\nFormat: {fmt} (280x192 scaled)"
+            result += f"\n\nUse the Read tool to view this file."
+            return result
+        else:
+            return f"Failed to capture GR{page}"
+
+    elif name == "read_gr_ascii":
+        page = args.get("page", 1)
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            filepath = f.name
+
+        success = emu.capture_gr(filepath, page=page, format="ascii")
+
+        if success:
+            with open(filepath, 'r') as f:
+                ascii_art = f.read()
+            import os
+            os.unlink(filepath)
+            return f"GR Page {page} (40x48, hex digits = colors 0-F):\n\n{ascii_art}"
+        else:
+            return f"Failed to capture GR{page}"
+
+    # --- DHGR (Double Hi-Res) Graphics ---
+    elif name == "capture_dhgr":
+        page = args.get("page", 1)
+        fmt = args.get("format", "png")
+        filename = args.get("filename")
+
+        import time
+        timestamp = int(time.time())
+
+        if fmt == "png":
+            # Capture as PPM first, then convert to PNG
+            ppm_file = f"/tmp/dhgr{page}_{timestamp}.ppm"
+            success = emu.capture_dhgr(ppm_file, page=page, format="ppm")
+            if success:
+                if filename:
+                    png_file = filename if filename.endswith('.png') else filename + '.png'
+                else:
+                    png_file = f"/tmp/dhgr{page}_{timestamp}.png"
+                filename = convert_ppm_to_png(ppm_file, png_file)
+        else:
+            if not filename:
+                ext = "txt" if fmt == "ascii" else "ppm"
+                filename = f"/tmp/dhgr{page}_{timestamp}.{ext}"
+            success = emu.capture_dhgr(filename, page=page, format=fmt)
+
+        if success:
+            result = f"Captured DHGR{page} to: {filename}\n"
+            result += f"Format: {fmt} (560x192 mono)"
+            result += f"\n\nUse the Read tool to view this file."
+            return result
+        else:
+            return f"Failed to capture DHGR{page} (requires //e with aux memory)"
+
+    elif name == "read_dhgr_ascii":
+        page = args.get("page", 1)
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            filepath = f.name
+
+        success = emu.capture_dhgr(filepath, page=page, format="ascii")
+
+        if success:
+            with open(filepath, 'r') as f:
+                ascii_art = f.read()
+            import os
+            os.unlink(filepath)
+            return f"DHGR Page {page} (560x192 as ASCII art):\n\n{ascii_art}"
+        else:
+            return f"Failed to capture DHGR{page} (requires //e with aux memory)"
+
+    # --- DGR (Double Lo-Res) Graphics ---
+    elif name == "capture_dgr":
+        page = args.get("page", 1)
+        fmt = args.get("format", "png")
+        native = args.get("native", False)
+        filename = args.get("filename")
+
+        import time
+        timestamp = int(time.time())
+        res = "native" if native else "scaled"
+
+        if fmt == "png":
+            # Capture as PPM first, then convert to PNG
+            ppm_file = f"/tmp/dgr{page}_{res}_{timestamp}.ppm"
+            success = emu.capture_dgr(ppm_file, page=page, format="ppm", native=native)
+            if success:
+                if filename:
+                    png_file = filename if filename.endswith('.png') else filename + '.png'
+                else:
+                    png_file = f"/tmp/dgr{page}_{res}_{timestamp}.png"
+                filename = convert_ppm_to_png(ppm_file, png_file)
+        else:
+            if not filename:
+                ext = "txt" if fmt == "ascii" else "ppm"
+                filename = f"/tmp/dgr{page}_{res}_{timestamp}.{ext}"
+            success = emu.capture_dgr(filename, page=page, format=fmt, native=native)
+
+        if success:
+            if native:
+                result = f"Captured DGR{page} to: {filename}\nFormat: {fmt} (80x48 native)"
+            else:
+                result = f"Captured DGR{page} to: {filename}\nFormat: {fmt} (560x192 scaled)"
+            result += f"\n\nUse the Read tool to view this file."
+            return result
+        else:
+            return f"Failed to capture DGR{page} (requires //e with aux memory)"
+
+    elif name == "read_dgr_ascii":
+        page = args.get("page", 1)
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            filepath = f.name
+
+        success = emu.capture_dgr(filepath, page=page, format="ascii")
+
+        if success:
+            with open(filepath, 'r') as f:
+                ascii_art = f.read()
+            import os
+            os.unlink(filepath)
+            return f"DGR Page {page} (80x48, hex digits = colors 0-F):\n\n{ascii_art}"
+        else:
+            return f"Failed to capture DGR{page} (requires //e with aux memory)"
+
+    # --- Input ---
+    elif name == "type_text":
+        text = args["text"]
+        press_return = args.get("press_return", True)
+        emu.type_text(text, include_return=press_return)
+        return f"Typed: {text}" + (" + RETURN" if press_return else "")
+
+    elif name == "send_key":
+        key = args["key"]
+        if key == "RETURN":
+            emu.send_return()
+        elif key == "ESCAPE":
+            emu.process.send('\x1b')
+        elif key == "CTRL-C":
+            emu.send_control('c')
+        elif key == "CTRL-RESET":
+            emu.reset(cold=False)
+        return f"Sent: {key}"
+
+    # --- BASIC ---
+    elif name == "run_basic":
+        command = args["command"]
+        timeout = args.get("timeout", 30)
+        output = emu.run_basic_command(command, timeout=timeout)
+        return output
+
+    # --- Tokenization ---
+    elif name == "type_and_capture":
+        basic_line = args["basic_line"]
+
+        # Clear any existing program
+        emu.run_basic_command("NEW")
+
+        # Type the line
+        emu.type_text(basic_line, include_return=True)
+        emu.wait_for_prompt("]")
+
+        # Read memory at $0801 to see tokenized form
+        data = emu.peek(0x0801, 128)
+
+        # Find end of program (00 00)
+        end = 0
+        for i in range(len(data) - 1):
+            if data[i] == 0 and data[i+1] == 0:
+                end = i + 2
+                break
+
+        tokenized = data[:end] if end > 0 else data[:32]
+        hex_str = ' '.join(f"{b:02X}" for b in tokenized)
+
+        # Annotate the tokens
+        annotations = annotate_tokenized(tokenized)
+
+        return f"Typed: {basic_line}\nTokenized ({len(tokenized)} bytes):\n{hex_str}\n\nAnnotation:\n{annotations}"
+
+    elif name == "tokenize":
+        source = args["source"]
+
+        # Use Bobbin's --tokenize feature
+        bobbin_path = emu.bobbin_path
+        result = subprocess.run(
+            [bobbin_path, "--tokenize"],
+            input=source,
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            return f"Tokenization failed: {result.stderr}"
+
+        # Output is binary, convert to hex
+        tokenized = result.stdout.encode('latin-1')
+        hex_str = ' '.join(f"{b:02X}" for b in tokenized)
+
+        return f"Tokenized ({len(tokenized)} bytes):\n{hex_str}"
+
+    elif name == "compare_tokenization":
+        basic_line = args["basic_line"]
+        your_hex = args["your_hex"].replace(' ', '').upper()
+
+        # Get Apple II's tokenization
+        emu.run_basic_command("NEW")
+        emu.type_text(basic_line, include_return=True)
+        emu.wait_for_prompt("]")
+
+        data = emu.peek(0x0801, 128)
+        end = 0
+        for i in range(len(data) - 1):
+            if data[i] == 0 and data[i+1] == 0:
+                end = i + 2
+                break
+
+        apple_tokenized = data[:end] if end > 0 else data[:32]
+        apple_hex = ''.join(f"{b:02X}" for b in apple_tokenized)
+
+        # Compare
+        match = apple_hex == your_hex
+
+        if match:
+            return f"MATCH! Both produce:\n{' '.join(apple_hex[i:i+2] for i in range(0, len(apple_hex), 2))}"
+        else:
+            # Find differences
+            diffs = []
+            max_len = max(len(apple_hex), len(your_hex))
+            for i in range(0, max_len, 2):
+                a = apple_hex[i:i+2] if i < len(apple_hex) else "--"
+                y = your_hex[i:i+2] if i < len(your_hex) else "--"
+                if a != y:
+                    diffs.append(f"  Offset {i//2}: Apple={a}, Yours={y}")
+
+            return f"MISMATCH!\nApple: {' '.join(apple_hex[i:i+2] for i in range(0, len(apple_hex), 2))}\nYours: {' '.join(your_hex[i:i+2] for i in range(0, len(your_hex), 2))}\n\nDifferences:\n" + '\n'.join(diffs)
+
+    # --- Injection ---
+    elif name == "inject_tokenized_basic":
+        hex_data = args["hex_data"]
+        load_addr = args.get("load_address", 0x0801)
+        auto_run = args.get("auto_run", False)
+
+        # Parse hex string
+        data = bytes.fromhex(hex_data.replace(' ', ''))
+
+        # Write the tokenized BASIC to memory
+        emu.poke(load_addr, list(data))
+
+        # Calculate end address
+        end_addr = load_addr + len(data)
+
+        # Update BASIC pointers
+        # TXTTAB ($67-68) = start of program
+        emu.poke(0x67, [load_addr & 0xFF, (load_addr >> 8) & 0xFF])
+
+        # VARTAB ($69-6A) = end of program
+        emu.poke(0x69, [end_addr & 0xFF, (end_addr >> 8) & 0xFF])
+
+        # ARYTAB ($6B-6C) = same as VARTAB initially
+        emu.poke(0x6B, [end_addr & 0xFF, (end_addr >> 8) & 0xFF])
+
+        # STREND ($6D-6E) = same as VARTAB initially
+        emu.poke(0x6D, [end_addr & 0xFF, (end_addr >> 8) & 0xFF])
+
+        # PRGEND ($AF-B0) = end of program
+        emu.poke(0xAF, [end_addr & 0xFF, (end_addr >> 8) & 0xFF])
+
+        result = f"Injected {len(data)} bytes at ${load_addr:04X}\n"
+        result += f"Updated pointers: TXTTAB=${load_addr:04X}, VARTAB=${end_addr:04X}"
+
+        if auto_run:
+            emu.exit_debugger()
+            output = emu.run_basic_command("RUN")
+            result += f"\n\nRUN output:\n{output}"
+
+        return result
+
+    # --- Observation ---
+    elif name == "get_registers":
+        regs = emu.get_registers()
+        return json.dumps(regs, indent=2)
+
+    elif name == "get_basic_pointers":
+        # Read all the important BASIC pointers
+        pointers = {}
+
+        txttab = emu.peek(0x67, 2)
+        pointers["TXTTAB"] = f"${txttab[0] + txttab[1]*256:04X} (program start)"
+
+        vartab = emu.peek(0x69, 2)
+        pointers["VARTAB"] = f"${vartab[0] + vartab[1]*256:04X} (variables start)"
+
+        arytab = emu.peek(0x6B, 2)
+        pointers["ARYTAB"] = f"${arytab[0] + arytab[1]*256:04X} (arrays start)"
+
+        strend = emu.peek(0x6D, 2)
+        pointers["STREND"] = f"${strend[0] + strend[1]*256:04X} (string storage end)"
+
+        fretop = emu.peek(0x6F, 2)
+        pointers["FRETOP"] = f"${fretop[0] + fretop[1]*256:04X} (free space top)"
+
+        himem = emu.peek(0x73, 2)
+        pointers["HIMEM"] = f"${himem[0] + himem[1]*256:04X} (highest address)"
+
+        prgend = emu.peek(0xAF, 2)
+        pointers["PRGEND"] = f"${prgend[0] + prgend[1]*256:04X} (program end)"
+
+        return json.dumps(pointers, indent=2)
+
+    # --- Knowledge Base ---
+    elif name == "record_technique":
+        KNOWLEDGE_DIR.mkdir(exist_ok=True)
+        techniques_file = KNOWLEDGE_DIR / "techniques.json"
+
+        # Load existing techniques
+        if techniques_file.exists():
+            with open(techniques_file) as f:
+                techniques = json.load(f)
+        else:
+            techniques = {"techniques": [], "version": 1}
+
+        # Add new technique
+        technique = {
+            "name": args["name"],
+            "category": args["category"],
+            "description": args["description"],
+            "steps": args.get("steps", []),
+            "success": args.get("success", True),
+            "notes": args.get("notes", ""),
+        }
+        techniques["techniques"].append(technique)
+
+        # Save
+        with open(techniques_file, 'w') as f:
+            json.dump(techniques, f, indent=2)
+
+        return f"Recorded technique: {args['name']}"
+
+    elif name == "query_techniques":
+        techniques_file = KNOWLEDGE_DIR / "techniques.json"
+
+        if not techniques_file.exists():
+            return "No techniques recorded yet."
+
+        with open(techniques_file) as f:
+            data = json.load(f)
+
+        results = data["techniques"]
+
+        # Filter by category
+        if "category" in args:
+            results = [t for t in results if t["category"] == args["category"]]
+
+        # Filter by search term
+        if "search" in args:
+            search = args["search"].lower()
+            results = [t for t in results if search in t["name"].lower() or search in t["description"].lower()]
+
+        if not results:
+            return "No matching techniques found."
+
+        output = []
+        for t in results:
+            output.append(f"- {t['name']} [{t['category']}] {'✓' if t.get('success', True) else '✗'}")
+            output.append(f"  {t['description']}")
+
+        return '\n'.join(output)
+
+    else:
+        return f"Unknown tool: {name}"
+
+
+def annotate_tokenized(data: list[int]) -> str:
+    """Annotate tokenized BASIC bytes."""
+    if len(data) < 4:
+        return "Too short to be valid BASIC"
+
+    lines = []
+    offset = 0
+
+    while offset < len(data) - 1:
+        # Check for end of program
+        if data[offset] == 0 and data[offset + 1] == 0:
+            lines.append(f"  {offset:3d}: 00 00 = End of program")
+            break
+
+        if offset + 3 >= len(data):
+            break
+
+        # Next line pointer
+        next_ptr = data[offset] + data[offset + 1] * 256
+        lines.append(f"  {offset:3d}: {data[offset]:02X} {data[offset+1]:02X} = Next line pointer (${next_ptr:04X})")
+        offset += 2
+
+        # Line number
+        if offset + 1 >= len(data):
+            break
+        line_num = data[offset] + data[offset + 1] * 256
+        lines.append(f"  {offset:3d}: {data[offset]:02X} {data[offset+1]:02X} = Line number {line_num}")
+        offset += 2
+
+        # Line contents until null
+        line_content = []
+        while offset < len(data) and data[offset] != 0:
+            b = data[offset]
+            if b in APPLESOFT_TOKENS:
+                line_content.append(f"{b:02X}={APPLESOFT_TOKENS[b]}")
+            elif 0x20 <= b <= 0x7F:
+                line_content.append(f"{b:02X}='{chr(b)}'")
+            else:
+                line_content.append(f"{b:02X}")
+            offset += 1
+
+        lines.append(f"        Content: {' '.join(line_content)}")
+
+        # End of line null
+        if offset < len(data):
+            lines.append(f"  {offset:3d}: 00 = End of line")
+            offset += 1
+
+    return '\n'.join(lines)
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+def main():
+    """Run the MCP server."""
+    import asyncio
+
+    async def run():
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+
+    asyncio.run(run())
+
+
+if __name__ == "__main__":
+    main()
