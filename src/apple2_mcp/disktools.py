@@ -274,6 +274,10 @@ class DOS33Disk:
         # Tokenize the BASIC program
         tokenized = tokenize_basic(basic_text)
 
+        # DOS 3.3 Applesoft files need a 2-byte length prefix
+        program_len = len(tokenized)
+        file_data = bytes([program_len & 0xFF, (program_len >> 8) & 0xFF]) + tokenized
+
         # Create track/sector list
         ts_track, ts_sector = self.allocate_sector()
         first_ts_track, first_ts_sector = ts_track, ts_sector
@@ -289,7 +293,7 @@ class DOS33Disk:
         ts_list_offset = 0x0C
         sector_count = 0
 
-        while data_offset < len(tokenized):
+        while data_offset < len(file_data):
             # Allocate data sector
             data_track, data_sector = self.allocate_sector()
 
@@ -299,7 +303,7 @@ class DOS33Disk:
             ts_list_offset += 2
 
             # Write data
-            chunk = tokenized[data_offset:data_offset + BYTES_PER_SECTOR]
+            chunk = file_data[data_offset:data_offset + BYTES_PER_SECTOR]
             self.write_sector(data_track, data_sector, chunk)
 
             data_offset += BYTES_PER_SECTOR
