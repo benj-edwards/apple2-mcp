@@ -45,3 +45,23 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+# Private/internal files
+knowledge/
+reports/
+*.md
+!README.md
+.claude/
+.mcp.json
+backups/
+backuops/
+
+# Game files (private projects)
+violent-checkers*
+checkers*
+vcheckers*
+test-board*
+*.dsk
+*.png
+*.zip
+*.html
