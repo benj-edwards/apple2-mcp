@@ -86,6 +86,11 @@ async def list_tools() -> list[Tool]:
                     "disk": {
                         "type": "string",
                         "description": "Optional path to disk image"
+                    },
+                    "uthernet2": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Enable Uthernet II network card in slot 3"
                     }
                 }
             }
@@ -229,7 +234,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="read_hgr_ascii",
-            description="Capture HGR screen as ASCII art and return it directly (no file).",
+            description="Capture HGR screen as ASCII art and return it directly (no file). NOTE: Fails if BASIC is waiting for GET input - use display-only test programs that END.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -276,7 +281,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="read_gr_ascii",
-            description="Capture GR screen as ASCII art (hex digits 0-F for colors) and return directly.",
+            description="Capture GR screen as ASCII art (hex digits 0-F for colors) and return directly. NOTE: Fails if BASIC is waiting for GET input - use display-only test programs that END.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -433,6 +438,89 @@ async def list_tools() -> list[Tool]:
                     }
                 },
                 "required": ["command"]
+            }
+        ),
+        Tool(
+            name="run_and_capture",
+            description="Run a BASIC program and capture the screen after it ends. Perfect for testing display code - the program should END so capture can work. Returns both program output and ASCII screen capture.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "default": "RUN",
+                        "description": "Command to execute (default: RUN)"
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "default": 30,
+                        "description": "Timeout in seconds"
+                    },
+                    "capture_mode": {
+                        "type": "string",
+                        "enum": ["gr", "hgr", "text"],
+                        "default": "gr",
+                        "description": "Screen mode to capture (gr=lo-res, hgr=hi-res, text=40x24 text)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="send_keys_and_capture",
+            description="Send keystrokes to break out of a GET loop, wait briefly, then capture the screen. Useful for testing interactive programs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "keys": {
+                        "type": "string",
+                        "description": "Keys to send (e.g., 'K' to move cursor down)"
+                    },
+                    "delay_ms": {
+                        "type": "integer",
+                        "default": 100,
+                        "minimum": 10,
+                        "maximum": 5000,
+                        "description": "Delay in milliseconds before capture (default: 100ms)"
+                    },
+                    "capture_mode": {
+                        "type": "string",
+                        "enum": ["gr", "hgr", "text"],
+                        "default": "gr",
+                        "description": "Screen mode to capture"
+                    }
+                },
+                "required": ["keys"]
+            }
+        ),
+        Tool(
+            name="clear_gr",
+            description="Clear the GR (lo-res) screen to a solid color. Convenience tool to avoid garbage in graphics memory.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "color": {
+                        "type": "integer",
+                        "default": 0,
+                        "minimum": 0,
+                        "maximum": 15,
+                        "description": "Fill color (0-15, default: 0=black)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="clear_hgr",
+            description="Clear the HGR (hi-res) screen to black. Convenience tool to avoid garbage in graphics memory.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "default": 1,
+                        "description": "HGR page to clear (1 or 2)"
+                    }
+                }
             }
         ),
 
@@ -661,6 +749,72 @@ async def list_tools() -> list[Tool]:
                 "required": ["disk_filename", "bas_filename"]
             }
         ),
+
+        # ProDOS Disk Tools
+        Tool(
+            name="prodos_list",
+            description="List files on a ProDOS disk image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "disk": {
+                        "type": "string",
+                        "description": "Path to the ProDOS disk image (.dsk or .po)"
+                    }
+                },
+                "required": ["disk"]
+            }
+        ),
+        Tool(
+            name="prodos_add",
+            description="Add a binary file to a ProDOS disk image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "disk": {
+                        "type": "string",
+                        "description": "Path to the ProDOS disk image"
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": "Path to the local file to add"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name for the file on disk (max 15 chars)"
+                    },
+                    "type": {
+                        "type": "string",
+                        "default": "BIN",
+                        "description": "File type: BIN, SYS, BAS, or TXT"
+                    },
+                    "addr": {
+                        "type": "string",
+                        "default": "0000",
+                        "description": "Load address in hex (for BIN files)"
+                    }
+                },
+                "required": ["disk", "file", "name"]
+            }
+        ),
+        Tool(
+            name="prodos_del",
+            description="Delete a file from a ProDOS disk image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "disk": {
+                        "type": "string",
+                        "description": "Path to the ProDOS disk image"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the file to delete"
+                    }
+                },
+                "required": ["disk", "name"]
+            }
+        ),
     ]
 
 
@@ -689,8 +843,13 @@ async def _call_tool_impl(name: str, args: dict[str, Any]) -> str:
     if name == "boot":
         machine = args.get("machine", "enhanced")
         disk = args.get("disk")
-        output = emu.boot(machine=machine, disk=disk)
-        return f"Emulator started ({machine}). Output:\n{output}"
+        uthernet2 = args.get("uthernet2", False)
+        output = emu.boot(machine=machine, disk=disk, uthernet2=uthernet2)
+        extras = []
+        if uthernet2:
+            extras.append("uthernet2 in slot 3")
+        extra_str = f" [{', '.join(extras)}]" if extras else ""
+        return f"Emulator started ({machine}{extra_str}). Output:\n{output}"
 
     elif name == "shutdown":
         emu.shutdown()
@@ -735,6 +894,8 @@ async def _call_tool_impl(name: str, args: dict[str, Any]) -> str:
     # --- Screen ---
     elif name == "read_screen":
         annotated = args.get("annotated", False)
+        # Use debugger-based method (pauses emulation briefly)
+        # TODO: SIGUSR1 method causes process death, investigate
         lines = emu.read_screen()
         return format_screen(lines, include_line_numbers=annotated)
 
@@ -977,6 +1138,92 @@ async def _call_tool_impl(name: str, args: dict[str, Any]) -> str:
         timeout = args.get("timeout", 30)
         output = emu.run_basic_command(command, timeout=timeout)
         return output
+
+    elif name == "run_and_capture":
+        command = args.get("command", "RUN")
+        timeout = args.get("timeout", 30)
+        capture_mode = args.get("capture_mode", "gr")
+
+        # Run the command
+        output = emu.run_basic_command(command, timeout=timeout)
+
+        # Capture the screen
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            filepath = f.name
+
+        if capture_mode == "gr":
+            success = emu.capture_gr(filepath, page=1, format="ascii")
+            mode_name = "GR (40x48)"
+        elif capture_mode == "hgr":
+            success = emu.capture_hgr(filepath, page=1, format="ascii")
+            mode_name = "HGR (280x192)"
+        else:  # text
+            lines = emu.read_screen()
+            screen = format_screen(lines, include_line_numbers=False)
+            return f"Command: {command}\nOutput: {output}\n\nText Screen:\n{screen}"
+
+        if success:
+            with open(filepath, 'r') as f:
+                ascii_art = f.read()
+            import os
+            os.unlink(filepath)
+            return f"Command: {command}\nOutput: {output}\n\n{mode_name} Screen:\n{ascii_art}"
+        else:
+            return f"Command: {command}\nOutput: {output}\n\nScreen capture failed (program may still be running or waiting for input)"
+
+    elif name == "send_keys_and_capture":
+        keys = args["keys"]
+        delay_ms = args.get("delay_ms", 100)
+        capture_mode = args.get("capture_mode", "gr")
+
+        # Send the keystrokes
+        for key in keys.upper():
+            emu.process.send(key)
+
+        # Wait for the delay
+        import time
+        time.sleep(delay_ms / 1000.0)
+
+        # Capture the screen
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            filepath = f.name
+
+        if capture_mode == "gr":
+            success = emu.capture_gr(filepath, page=1, format="ascii")
+            mode_name = "GR (40x48)"
+        elif capture_mode == "hgr":
+            success = emu.capture_hgr(filepath, page=1, format="ascii")
+            mode_name = "HGR (280x192)"
+        else:  # text
+            lines = emu.read_screen()
+            screen = format_screen(lines, include_line_numbers=False)
+            return f"Sent keys: {keys}\n\nText Screen:\n{screen}"
+
+        if success:
+            with open(filepath, 'r') as f:
+                ascii_art = f.read()
+            import os
+            os.unlink(filepath)
+            return f"Sent keys: {keys}\n\n{mode_name} Screen:\n{ascii_art}"
+        else:
+            return f"Sent keys: {keys}\n\nScreen capture failed"
+
+    elif name == "clear_gr":
+        color = args.get("color", 0)
+        # Enter GR mode and clear with the specified color
+        emu.run_basic_command(f"GR:COLOR={color}:FOR I=0 TO 39:VLIN 0,39 AT I:NEXT")
+        return f"Cleared GR screen to color {color}"
+
+    elif name == "clear_hgr":
+        page = args.get("page", 1)
+        # Enter HGR mode and clear
+        if page == 1:
+            emu.run_basic_command("HGR:HCOLOR=0:FOR Y=0 TO 191:HPLOT 0,Y TO 279,Y:NEXT")
+        else:
+            emu.run_basic_command("HGR2:HCOLOR=0:FOR Y=0 TO 191:HPLOT 0,Y TO 279,Y:NEXT")
+        return f"Cleared HGR page {page} to black"
 
     # --- Tokenization ---
     elif name == "type_and_capture":
@@ -1256,6 +1503,45 @@ async def _call_tool_impl(name: str, args: dict[str, Any]) -> str:
         disk.save()
 
         return f"Saved {program_name.upper()} ({sectors} sectors) from {bas_filename} to {disk_filename}"
+
+    # --- ProDOS Disk Tools ---
+    elif name == "prodos_list":
+        disk = args["disk"]
+        # Use the Python prodos tools from claude-code-apple2
+        tools_dir = Path(__file__).parent.parent.parent.parent / "claude-code-apple2" / "tools"
+        result = subprocess.run(
+            ["python3", str(tools_dir / "prodos_delete.py"), disk, "list"],
+            capture_output=True, text=True
+        )
+        return result.stdout or result.stderr
+
+    elif name == "prodos_add":
+        disk = args["disk"]
+        file = args["file"]
+        name_on_disk = args["name"]
+        file_type = args.get("type", "BIN").upper()
+        addr = args.get("addr", "0000")
+
+        type_map = {"BIN": "06", "SYS": "FF", "BAS": "FC", "TXT": "04"}
+        type_code = type_map.get(file_type, "06")
+
+        tools_dir = Path(__file__).parent.parent.parent.parent / "claude-code-apple2" / "tools"
+        result = subprocess.run(
+            ["python3", str(tools_dir / "prodos_add.py"), disk, file, name_on_disk, type_code, addr],
+            capture_output=True, text=True
+        )
+        return result.stdout or result.stderr
+
+    elif name == "prodos_del":
+        disk = args["disk"]
+        name_to_del = args["name"]
+
+        tools_dir = Path(__file__).parent.parent.parent.parent / "claude-code-apple2" / "tools"
+        result = subprocess.run(
+            ["python3", str(tools_dir / "prodos_delete.py"), disk, "delete", name_to_del],
+            capture_output=True, text=True
+        )
+        return result.stdout or result.stderr or "Deleted"
 
     else:
         return f"Unknown tool: {name}"
