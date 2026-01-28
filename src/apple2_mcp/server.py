@@ -196,6 +196,11 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "default": False,
                         "description": "Include line numbers"
+                    },
+                    "nonblocking": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Use non-blocking capture (preserves network connections)"
                     }
                 }
             }
@@ -894,9 +899,15 @@ async def _call_tool_impl(name: str, args: dict[str, Any]) -> str:
     # --- Screen ---
     elif name == "read_screen":
         annotated = args.get("annotated", False)
-        # Use debugger-based method (pauses emulation briefly)
-        # TODO: SIGUSR1 method causes process death, investigate
-        lines = emu.read_screen()
+        nonblocking = args.get("nonblocking", False)
+
+        if nonblocking:
+            # Use SIGUSR1-based capture (doesn't pause emulation)
+            lines = emu.read_screen_nonblocking()
+        else:
+            # Use debugger-based method (pauses emulation briefly)
+            lines = emu.read_screen()
+
         return format_screen(lines, include_line_numbers=annotated)
 
     # --- Graphics ---
