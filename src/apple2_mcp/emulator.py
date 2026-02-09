@@ -1,6 +1,8 @@
 """Bobbin emulator process manager.
 
 Uses pexpect to control the Bobbin Apple II emulator interactively.
+Now with optional Unix socket control channel for reliable AI/MCP integration.
+
 Provides methods for:
 - Starting/stopping the emulator
 - Sending keystrokes
@@ -9,6 +11,9 @@ Provides methods for:
 - Managing snapshots
 """
 
+from __future__ import annotations
+
+import atexit
 import os
 import re
 import signal
@@ -18,11 +23,60 @@ from pathlib import Path
 from typing import Optional
 
 import pexpect
+from pexpect import popen_spawn
 
 from .screen import decode_screen, SCREEN_LINE_ADDRESSES, SCREEN_WIDTH, SCREEN_HEIGHT
+from .control_socket import BobbinControlSocket, ControlSocketError
+
+# PID file for tracking emulator process
+BOBBIN_PID_FILE = "/tmp/bobbin.pid"
 
 # Path where Bobbin writes screen dump on SIGUSR1
 SIGUSR1_SCREEN_PATH = "/tmp/bobbin_screen.txt"
+
+
+def _kill_stale_bobbin():
+    """Kill any stale Bobbin process from PID file."""
+    if os.path.exists(BOBBIN_PID_FILE):
+        try:
+            with open(BOBBIN_PID_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            # Check if process exists
+            os.kill(pid, 0)
+            # Process exists, try graceful then forceful kill
+            try:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.5)
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # Already dead
+        except (ValueError, ProcessLookupError, FileNotFoundError, PermissionError):
+            pass  # PID invalid or process doesn't exist
+        finally:
+            try:
+                os.remove(BOBBIN_PID_FILE)
+            except OSError:
+                pass
+
+
+def _write_pid_file(pid: int):
+    """Write PID file for tracking."""
+    try:
+        with open(BOBBIN_PID_FILE, 'w') as f:
+            f.write(str(pid))
+    except OSError:
+        pass  # Non-fatal
+
+
+def _remove_pid_file():
+    """Remove PID file."""
+    try:
+        os.remove(BOBBIN_PID_FILE)
+    except OSError:
+        pass
+
+# Default control socket path
+DEFAULT_CONTROL_SOCKET = "/tmp/bobbin.sock"
 
 
 class BobbinError(Exception):
@@ -33,22 +87,27 @@ class BobbinError(Exception):
 class Emulator:
     """Manages a Bobbin emulator process."""
 
-    # Debugger prompt pattern
-    DEBUGGER_PROMPT = ">"
+    # Debugger prompt pattern - Bobbin uses "BOBBIN> " or may just use ">"
+    # We match either for flexibility
+    DEBUGGER_PROMPT_PATTERN = r'(?:BOBBIN> |^> |\n> )'
 
     # Default Bobbin path (can be overridden)
     DEFAULT_BOBBIN_PATH = None
 
-    def __init__(self, bobbin_path: Optional[str] = None):
+    def __init__(self, bobbin_path: Optional[str] = None,
+                 control_socket: Optional[str] = DEFAULT_CONTROL_SOCKET):
         """Initialize emulator manager.
 
         Args:
             bobbin_path: Path to bobbin executable. If None, searches common locations.
+            control_socket: Path to control socket. Set to None to disable.
         """
         self.bobbin_path = bobbin_path or self._find_bobbin()
         self.process: Optional[pexpect.spawn] = None
         self.in_debugger = False
         self.machine_type = "enhanced"
+        self.control_socket_path = control_socket
+        self.control_socket: Optional[BobbinControlSocket] = None
 
     def _find_bobbin(self) -> str:
         """Find the bobbin executable."""
@@ -78,13 +137,17 @@ class Emulator:
         return self.process is not None and self.process.isalive()
 
     def boot(self, machine: str = "enhanced", disk: Optional[str] = None,
-             timeout: float = 10.0, uthernet2: bool = False) -> str:
-        """Start the emulator and wait for BASIC prompt.
+             timeout: float = 60.0, uthernet2: bool = False,
+             mouse: bool = False, wait_for_prompt: bool = True) -> str:
+        """Start the emulator and optionally wait for BASIC prompt.
 
         Args:
             machine: Machine type (plus, enhanced, twoey, original)
             disk: Optional disk image path to load
+            timeout: Timeout in seconds for boot (default 60)
             uthernet2: Enable Uthernet II network card emulation in slot 3
+            mouse: Enable AppleMouse card emulation in slot 4
+            wait_for_prompt: Wait for BASIC prompt (set False for ProDOS selector disks)
 
         Returns:
             Initial screen contents
@@ -92,41 +155,93 @@ class Emulator:
         if self.is_running:
             self.shutdown()
 
+        # Kill any stale emulator from previous sessions
+        _kill_stale_bobbin()
+
         self.machine_type = machine
 
         # Build command
-        cmd = [self.bobbin_path, "--simple", "-m", machine]
+        # --remain keeps bobbin running even if stdin gets EOF
+        cmd = [self.bobbin_path, "--simple", "--remain", "-m", machine]
         if disk:
             cmd.extend(["--disk", disk])
         if uthernet2:
             cmd.append("--uthernet2")
+        if mouse:
+            cmd.append("--mouse")
 
-        # Start process
+        # Add control socket if configured
+        if self.control_socket_path:
+            cmd.extend(["--control-socket", self.control_socket_path])
+
+        # Start process with PTY
         self.process = pexpect.spawn(
             cmd[0],
             cmd[1:],
             encoding='latin-1',  # Apple II uses high-bit ASCII
             timeout=timeout,
+            ignore_sighup=True,
         )
+        self.process.setecho(False)
 
-        # Wait for the BASIC prompt (])
-        try:
-            self.process.expect(r'\]', timeout=timeout)
-        except pexpect.TIMEOUT:
-            raise BobbinError("Timeout waiting for BASIC prompt")
+        # Track PID for cleanup on restart
+        _write_pid_file(self.process.pid)
 
-        # Give emulator a moment to settle and flush any pending output
+        # Wait for the BASIC prompt (] at start of line) if requested
+        # Use \n] pattern to match the actual BASIC prompt, not ] in Bobbin banner
+        if wait_for_prompt:
+            try:
+                self.process.expect(r'\n\]', timeout=timeout)
+            except pexpect.TIMEOUT:
+                raise BobbinError("Timeout waiting for BASIC prompt")
+        else:
+            # Just wait a moment for emulator to start
+            time.sleep(2.0)
+
+        # Give emulator time to settle and aggressively drain all buffered output
+        # This prevents stale data from interfering with subsequent commands
         time.sleep(0.2)
-        try:
-            self.process.read_nonblocking(size=65536, timeout=0.1)
-        except Exception:
-            pass
+        for _ in range(5):
+            try:
+                data = self.process.read_nonblocking(4096, timeout=0.05)
+                if not data:
+                    break
+            except pexpect.TIMEOUT:
+                break
+            except pexpect.EOF:
+                # Check if process is actually dead
+                if not self.process.isalive():
+                    raise BobbinError("Emulator process died during boot")
+                break
+            time.sleep(0.02)
 
         self.in_debugger = False
-        return self.process.before + "]"
+
+        # Connect to control socket if configured
+        if self.control_socket_path:
+            time.sleep(0.3)  # Give socket time to initialize
+            self.control_socket = BobbinControlSocket(self.control_socket_path)
+            if self.control_socket.connect(timeout=2.0):
+                try:
+                    self.control_socket.ping()
+                except ControlSocketError:
+                    self.control_socket = None
+            else:
+                self.control_socket = None
+
+        return (self.process.before or "") + "]"
 
     def shutdown(self):
         """Stop the emulator."""
+        # Disconnect control socket first
+        if self.control_socket:
+            try:
+                self.control_socket.quit()
+            except Exception:
+                pass
+            self.control_socket.disconnect()
+            self.control_socket = None
+
         if self.process:
             try:
                 # Try graceful exit via debugger
@@ -141,8 +256,38 @@ class Emulator:
                 self.process = None
                 self.in_debugger = False
 
-    def enter_debugger(self, timeout: float = 2.0) -> bool:
+        # Clean up PID file
+        _remove_pid_file()
+
+    def pause(self):
+        """Pause emulation to save CPU. Call resume() before next operation."""
+        if self.control_socket:
+            try:
+                self.control_socket.pause()
+            except ControlSocketError:
+                pass
+
+    def resume(self):
+        """Resume emulation after pause."""
+        if self.control_socket:
+            try:
+                self.control_socket.resume()
+            except ControlSocketError:
+                pass
+
+    def _ensure_running(self):
+        """Ensure emulator is running (not paused). Call before operations."""
+        self.resume()
+
+    def enter_debugger(self, timeout: float = 2.0, max_retries: int = 3) -> bool:
         """Enter the Bobbin debugger (Ctrl-C twice).
+
+        Uses retry logic to handle intermittent failures caused by timing
+        issues or stale state.
+
+        Args:
+            timeout: Timeout for each attempt
+            max_retries: Maximum number of attempts before giving up
 
         Returns:
             True if now in debugger
@@ -150,85 +295,79 @@ class Emulator:
         if not self.is_running:
             raise BobbinError("Emulator not running")
 
-        if self.in_debugger:
-            # Verify we're actually at a prompt
-            try:
-                self.process.read_nonblocking(size=65536, timeout=0.05)
-            except Exception:
-                pass
-            self.process.sendline("")
-            try:
-                self.process.expect(r'\n>', timeout=0.5)
-                return True
-            except pexpect.TIMEOUT:
-                # We thought we were in debugger but aren't
+        # Try multiple times with increasing delays
+        for attempt in range(max_retries):
+            # Clear stale state - the debugger may have exited naturally
+            # (e.g., 'keys' command auto-exits) but the flag wasn't updated
+            if attempt > 0:
                 self.in_debugger = False
+                time.sleep(0.1 * attempt)  # Increasing backoff
 
-        # Aggressively flush any pending output
-        for _ in range(3):
-            try:
-                self.process.read_nonblocking(size=65536, timeout=0.1)
-            except Exception:
-                pass
+            if self.in_debugger:
+                # Verify we're actually in debugger by sending 'help' command
+                # IMPORTANT: Do NOT send empty line - it triggers single-step mode!
+                try:
+                    self.process.sendline("help")
+                    self.process.expect(r'BOBBIN> ', timeout=0.5)
+                    return True
+                except pexpect.TIMEOUT:
+                    # Not actually in debugger, clear flag and try again
+                    self.in_debugger = False
+
+            # Drain any buffered output before sending Ctrl-C
+            for _ in range(5):
+                try:
+                    data = self.process.read_nonblocking(4096, timeout=0.02)
+                    if not data:
+                        break
+                except pexpect.TIMEOUT:
+                    break
+                except pexpect.EOF:
+                    # Check if process is actually dead
+                    if not self.process.isalive():
+                        raise BobbinError("Emulator process died unexpectedly")
+                    break
             time.sleep(0.05)
 
-        # Try up to 3 times to enter debugger
-        for attempt in range(3):
-            # Send Ctrl-C twice with delays
+            # Send Ctrl-C twice via stdin to enter debugger
+            # Bobbin explicitly says "Ctrl-C *TWICE* to enter debugger"
             self.process.sendcontrol('c')
-            time.sleep(0.1)
+            time.sleep(0.15)
             self.process.sendcontrol('c')
-            time.sleep(0.2)
 
-            # Wait for debugger prompt (includes register dump ending with >)
+            # Small delay to let the debugger activate
+            time.sleep(0.3)
+
+            # Wait for debugger prompt - try multiple patterns
+            # Bobbin uses "BOBBIN> " as its prompt
             try:
-                self.process.expect(r'>', timeout=timeout)
+                # Use a simpler, more reliable pattern
+                self.process.expect(r'BOBBIN> ', timeout=timeout)
                 self.in_debugger = True
-                # Verify by sending empty line and waiting for prompt
-                time.sleep(0.1)
-                try:
-                    self.process.read_nonblocking(size=65536, timeout=0.05)
-                except Exception:
-                    pass
-                self.process.sendline("")
-                try:
-                    self.process.expect(r'\n>', timeout=0.5)
-                except pexpect.TIMEOUT:
-                    pass  # Continue anyway - first expect succeeded
+
+                # Drain any buffered output to ensure clean state
+                time.sleep(0.05)
+                for _ in range(3):
+                    try:
+                        self.process.read_nonblocking(4096, timeout=0.02)
+                    except pexpect.TIMEOUT:
+                        break
+                    except pexpect.EOF:
+                        if not self.process.isalive():
+                            raise BobbinError("Emulator died in debugger")
+                        break
+
                 return True
             except pexpect.TIMEOUT:
-                # Flush and try again
-                try:
-                    self.process.read_nonblocking(size=65536, timeout=0.1)
-                except Exception:
-                    pass
+                # Check if we got partial output that indicates debugger
+                if self.process.before and 'BOBBIN' in self.process.before:
+                    self.in_debugger = True
+                    return True
+                # Try again on next iteration
+                continue
 
+        # All retries exhausted
         return False
-
-    def sync_debugger(self, timeout: float = 1.0) -> bool:
-        """Synchronize debugger state by sending empty command and waiting for prompt.
-
-        This ensures we're at a known state (debugger prompt) before continuing.
-
-        Returns:
-            True if synchronized successfully
-        """
-        if not self.in_debugger:
-            return False
-
-        # Flush any pending output
-        try:
-            self.process.read_nonblocking(size=65536, timeout=0.05)
-        except Exception:
-            pass
-
-        # Send empty line and wait for prompt on new line
-        self.process.sendline("")
-        try:
-            self.process.expect(r'\n>', timeout=timeout)
-            return True
-        except pexpect.TIMEOUT:
-            return False
 
     def exit_debugger(self, timeout: float = 2.0) -> bool:
         """Exit debugger and continue emulation.
@@ -236,38 +375,35 @@ class Emulator:
         Returns:
             True if exited debugger
         """
+        # Only try to exit if we think we're in debugger
         if not self.in_debugger:
             return True
 
-        # First sync to make sure we're at a prompt
-        self.sync_debugger(timeout=0.5)
-
-        # Flush before sending continue
-        try:
-            self.process.read_nonblocking(size=65536, timeout=0.05)
-        except Exception:
-            pass
-
+        # IMPORTANT: Do NOT send empty lines - they trigger single-step mode!
+        # Just send 'c' to continue execution
         self.process.sendline("c")
-        self.in_debugger = False
 
         # Wait for "Continuing..." message
         try:
-            self.process.expect(r'Continuing\.\.\.', timeout=0.5)
+            self.process.expect(r'Continuing\.\.\.', timeout=1.0)
         except pexpect.TIMEOUT:
             pass
 
-        # Give emulator time to resume and stabilize
+        # Wait a moment for emulator to resume
         time.sleep(0.3)
 
-        # Aggressively flush any buffered output (multiple attempts)
-        for _ in range(3):
+        # Drain any remaining output
+        for _ in range(5):
             try:
-                self.process.read_nonblocking(size=65536, timeout=0.05)
-            except Exception:
-                pass
-            time.sleep(0.05)
+                self.process.read_nonblocking(4096, timeout=0.05)
+            except pexpect.TIMEOUT:
+                break
+            except pexpect.EOF:
+                if not self.process.isalive():
+                    raise BobbinError("Emulator died exiting debugger")
+                break
 
+        self.in_debugger = False
         return True
 
     def debugger_command(self, cmd: str, timeout: float = 2.0,
@@ -278,7 +414,7 @@ class Emulator:
             cmd: Command to execute
             timeout: Timeout for command response
             stay_in_debugger: If True, stay in debugger after command.
-                              If False, exit debugger if we entered it.
+                              If False, always exit debugger after command.
 
         Returns:
             Command output
@@ -295,16 +431,37 @@ class Emulator:
 
         # Wait for next prompt
         try:
-            self.process.expect(r'\n>', timeout=timeout)
+            self.process.expect(r'BOBBIN> ', timeout=timeout)
+            output = self.process.before
+        except pexpect.TIMEOUT:
+            # Check if we got partial output
+            output = self.process.before if self.process.before else ""
+
+        # Exit debugger if caller doesn't want to stay
+        # Always try to exit to ensure clean state
+        if not stay_in_debugger:
+            self.exit_debugger()
+
+        return output.strip()
+
+    def debugger_help(self) -> str:
+        """Get debugger help - for debugging purposes."""
+        if not self.is_running:
+            raise BobbinError("Emulator not running")
+
+        if not self.in_debugger:
+            if not self.enter_debugger():
+                raise BobbinError("Failed to enter debugger")
+
+        self.process.sendline("help")
+
+        try:
+            self.process.expect(r'BOBBIN> ', timeout=5.0)
             output = self.process.before
         except pexpect.TIMEOUT:
             output = self.process.before if self.process.before else ""
 
-        # Exit debugger if we entered it and caller doesn't want to stay
-        if not stay_in_debugger and not was_in_debugger:
-            self.exit_debugger()
-
-        return output.strip()
+        return output
 
     def peek(self, address: int, count: int = 1) -> list[int]:
         """Read bytes from memory.
@@ -316,13 +473,24 @@ class Emulator:
         Returns:
             List of byte values
         """
+        # Use control socket if available (much more reliable)
+        if self.control_socket:
+            try:
+                return self.control_socket.peek(address, count)
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to debugger method
+        # Use longer timeout for large reads (1 second per 256 bytes, minimum 3 seconds)
+        read_timeout = max(3.0, count / 256)
+
         if count == 1:
             # Single byte
-            output = self.debugger_command(f"{address:04X}", stay_in_debugger=False)
+            output = self.debugger_command(f"{address:04X}", timeout=read_timeout, stay_in_debugger=False)
         else:
             # Range
             end_addr = min(address + count - 1, 0xFFFF)
-            output = self.debugger_command(f"{address:04X}.{end_addr:04X}", stay_in_debugger=False)
+            output = self.debugger_command(f"{address:04X}.{end_addr:04X}", timeout=read_timeout, stay_in_debugger=False)
 
         # Parse hex output
         # Format: "0400: A0 A0 A0 A0 A0 A0 A0 A0"
@@ -357,50 +525,42 @@ class Emulator:
         elif isinstance(data, bytes):
             data = list(data)
 
-        # Chunk large writes to avoid overwhelming pexpect/debugger
-        # Each byte becomes "XX " (3 chars), plus address prefix ~7 chars
-        # Keep command lines under ~200 bytes for reliability
-        CHUNK_SIZE = 64  # bytes per command
-
-        was_in_debugger = self.in_debugger
-        if not was_in_debugger:
-            if not self.enter_debugger():
-                raise BobbinError("Failed to enter debugger for poke")
-
-        for offset in range(0, len(data), CHUNK_SIZE):
-            chunk = data[offset:offset + CHUNK_SIZE]
-            chunk_addr = address + offset
-            hex_values = ' '.join(f"{b:02X}" for b in chunk)
-            cmd = f"{chunk_addr:04X}: {hex_values}"
-
-            # Flush before sending command
+        # Use control socket if available (much more reliable)
+        if self.control_socket:
             try:
-                self.process.read_nonblocking(size=65536, timeout=0.01)
-            except Exception:
-                pass
+                self.control_socket.poke(address, data)
+                return True
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
 
-            # Send command and wait for prompt on new line
-            self.process.sendline(cmd)
-            try:
-                # Wait for newline followed by prompt - more specific pattern
-                self.process.expect(r'\n>', timeout=2.0)
-            except pexpect.TIMEOUT:
-                # Try to recover by syncing
-                self.sync_debugger(timeout=1.0)
+        # Fall back to debugger method
+        # Build command: "addr: val val val..."
+        hex_values = ' '.join(f"{b:02X}" for b in data)
+        cmd = f"{address:04X}: {hex_values}"
 
-            # Small delay between chunks to avoid overwhelming
-            if len(data) > CHUNK_SIZE:
-                time.sleep(0.01)
-
-        # Sync to ensure we're at a known state
-        self.sync_debugger(timeout=1.0)
-
-        # For large writes, stay in debugger to avoid re-entry issues
-        # Only exit if we entered and data was small
-        if not was_in_debugger and len(data) <= 64:
-            self.exit_debugger()
-
+        self.debugger_command(cmd, stay_in_debugger=False)
         return True
+
+    def load(self, address: int, hex_data: str) -> int:
+        """Load hex data into memory. More efficient than poke for large blocks.
+
+        Args:
+            address: Starting address
+            hex_data: Hex string (e.g., "A9008D0008")
+
+        Returns:
+            Number of bytes loaded
+        """
+        if self.control_socket:
+            try:
+                return self.control_socket.load(address, hex_data)
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to poke via debugger
+        data = bytes.fromhex(hex_data.replace(' ', ''))
+        self.poke(address, list(data))
+        return len(data)
 
     def read_screen_memory(self) -> dict[int, int]:
         """Read the entire text screen memory.
@@ -408,36 +568,27 @@ class Emulator:
         Returns:
             Dict mapping addresses to byte values
         """
-        # Enter debugger once for the whole operation
-        was_in_debugger = self.in_debugger
-        if not was_in_debugger:
-            if not self.enter_debugger():
-                raise BobbinError("Failed to enter debugger for screen read")
-
         memory = {}
 
-        # Read text page 1 ($0400-$07FF) in chunks to avoid huge reads
-        for start in range(0x0400, 0x0800, 0x100):
-            end_addr = start + 0xFF
-            output = self.debugger_command(f"{start:04X}.{end_addr:04X}", stay_in_debugger=True)
+        # Read text page 1 ($0400-$07FF) using debugger_command
+        # stay_in_debugger=False ensures we exit cleanly
+        end_addr = 0x0400 + 0x0400 - 1  # 0x07FF
+        output = self.debugger_command(f"0400.{end_addr:04X}", stay_in_debugger=False)
 
-            # Parse hex output
-            for line in output.split('\n'):
-                if ':' in line:
-                    hex_part = line.split(':', 1)[1]
-                else:
-                    hex_part = line
+        # Parse hex output
+        bytes_list = []
+        for line in output.split('\n'):
+            if ':' in line:
+                hex_part = line.split(':', 1)[1]
+            else:
+                hex_part = line
+            for token in hex_part.split():
+                token = token.strip()
+                if len(token) == 2 and all(c in '0123456789ABCDEFabcdef' for c in token):
+                    bytes_list.append(int(token, 16))
 
-                for token in hex_part.split():
-                    token = token.strip()
-                    if re.match(r'^[0-9A-Fa-f]{2}$', token):
-                        addr = start + len([k for k in memory if k >= start])
-                        if addr < 0x0800:
-                            memory[addr] = int(token, 16)
-
-        # Exit debugger if we entered it
-        if not was_in_debugger:
-            self.exit_debugger()
+        for i, byte in enumerate(bytes_list[:0x0400]):
+            memory[0x0400 + i] = byte
 
         return memory
 
@@ -447,15 +598,22 @@ class Emulator:
         Returns:
             List of 24 strings, each 40 characters
         """
+        # Use control socket if available (much more reliable)
+        if self.control_socket:
+            try:
+                return self.control_socket.read_screen()
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to debugger method
         memory = self.read_screen_memory()
         return decode_screen(memory)
 
     def read_screen_nonblocking(self, timeout: float = 1.0) -> list[str]:
-        """Read the screen without stopping emulation using SIGUSR1.
+        """Read the screen without stopping emulation.
 
-        This method sends SIGUSR1 to Bobbin, which triggers a non-blocking
-        screen dump to /tmp/bobbin_screen.txt. This is ideal for capturing
-        screen state during network operations without disrupting TCP state.
+        Uses control socket if available (preferred), otherwise falls back
+        to SIGUSR1-based capture.
 
         Args:
             timeout: Maximum time to wait for screen file to appear
@@ -466,6 +624,14 @@ class Emulator:
         if not self.is_running:
             raise BobbinError("Emulator not running")
 
+        # Use control socket if available (much more reliable)
+        if self.control_socket:
+            try:
+                return self.control_socket.read_screen()
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to SIGUSR1 method
         # Remove old screen file if it exists
         try:
             os.unlink(SIGUSR1_SCREEN_PATH)
@@ -505,6 +671,10 @@ class Emulator:
         This method uses Bobbin's keyboard injection queue, which bypasses
         timing issues that can occur with stdin-based input.
 
+        IMPORTANT: The Bobbin 'keys' command auto-exits the debugger after
+        injecting keystrokes. We must NOT call exit_debugger() afterward,
+        as that would send 'c' to the Apple II keyboard instead of the debugger.
+
         Args:
             text: Text to inject (will be uppercased)
             include_return: Add RETURN at end
@@ -512,54 +682,102 @@ class Emulator:
         if not self.is_running:
             raise BobbinError("Emulator not running")
 
+        # Auto-resume if paused - CPU needs to process keystrokes
+        self._ensure_running()
+
         # Apple II is uppercase
         text = text.upper()
-
-        # Escape special characters for the keys command
-        escaped = text.replace('\\', '\\\\')
         if include_return:
-            escaped += '\\r'
+            text += '\r'
 
-        # Use debugger command to inject keys
-        was_in_debugger = self.in_debugger
-        if not was_in_debugger:
-            self.enter_debugger()
-
-        self.debugger_command(f"keys {escaped}")
-
-        if not was_in_debugger:
-            # Exit debugger and consume output so it doesn't pollute pexpect buffer
-            self.process.sendline("c")
-            self.in_debugger = False
-            # Wait briefly for emulation to start processing keys
-            time.sleep(0.05)
-            # Consume any debugger output from pexpect buffer
+        # Use control socket if available (much more reliable)
+        if self.control_socket:
             try:
-                self.process.expect(r'Continuing\.\.\.', timeout=0.5)
+                self.control_socket.inject_keys(text)
+                return
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to debugger method
+        # Escape special characters for the keys command
+        # Backslashes and quotes need escaping for Bobbin's command parser
+        escaped = text.replace('\\', '\\\\')
+        escaped = escaped.replace('"', '\\"')
+        escaped = escaped.replace('\r', '\\r')
+
+        # Enter debugger for key injection
+        if not self.enter_debugger():
+            raise BobbinError("Failed to enter debugger for key injection")
+
+        # Send the keys command - this auto-exits the debugger
+        self.process.sendline(f"keys {escaped}")
+
+        # Wait for the "Injected N characters" confirmation
+        try:
+            self.process.expect(r'Injected \d+ characters\.', timeout=2.0)
+        except pexpect.TIMEOUT:
+            pass
+
+        # keys command auto-exits debugger
+        self.in_debugger = False
+
+        # Wait for BASIC prompt to confirm ready for next command
+        try:
+            self.process.expect(r'\]', timeout=1.0)
+        except pexpect.TIMEOUT:
+            pass
+
+        # Drain remaining output
+        time.sleep(0.2)
+        for _ in range(5):
+            try:
+                self.process.read_nonblocking(4096, timeout=0.03)
             except pexpect.TIMEOUT:
-                pass
+                break
+            except pexpect.EOF:
+                if not self.process.isalive():
+                    raise BobbinError("Emulator died after key injection")
+                break
 
     def type_text(self, text: str, delay: float = 0.02,
-                  include_return: bool = False, use_inject: bool = False) -> None:
+                  include_return: bool = False, use_inject: bool = True) -> None:
         """Type text into the emulator.
 
         Args:
             text: Text to type (will be uppercased)
             delay: Delay between keystrokes (ignored if use_inject=True)
             include_return: Add RETURN at end
-            use_inject: Use reliable keyboard injection (recommended for AI agents)
+            use_inject: Use reliable keyboard injection (default True for AI agents)
         """
         if not self.is_running:
             raise BobbinError("Emulator not running")
+
+        # Auto-resume if paused - CPU needs to process keystrokes
+        self._ensure_running()
 
         # Use reliable injection by default
         if use_inject:
             self.inject_keys(text, include_return)
             return
 
-        # Legacy stdin-based input (may have timing issues)
+        # stdin-based input
         if self.in_debugger:
             self.exit_debugger()
+
+        # Drain any pending output before typing
+        # This ensures clean state after debugger operations
+        for _ in range(5):
+            try:
+                self.process.read_nonblocking(4096, timeout=0.02)
+            except pexpect.TIMEOUT:
+                break
+            except pexpect.EOF:
+                if not self.process.isalive():
+                    raise BobbinError("Emulator died before typing")
+                break
+
+        # Small delay to ensure emulator is ready
+        time.sleep(0.1)
 
         # Apple II is uppercase
         text = text.upper()
@@ -571,6 +789,9 @@ class Emulator:
 
         if include_return:
             self.process.send('\r')
+
+        # Give emulator time to process the input
+        time.sleep(0.2)
 
     def send_return(self) -> None:
         """Send RETURN key."""
@@ -594,6 +815,30 @@ class Emulator:
         Returns:
             Dict with A, X, Y, SP, PC, and flags
         """
+        # Use control socket if available (much more reliable)
+        if self.control_socket:
+            try:
+                cpu = self.control_socket.get_cpu_state()
+                # Map control socket format to our format
+                p = cpu.get('p', 0)
+                return {
+                    'A': cpu.get('a', 0),
+                    'X': cpu.get('x', 0),
+                    'Y': cpu.get('y', 0),
+                    'SP': cpu.get('sp', 0),
+                    'PC': cpu.get('pc', 0),
+                    'N': bool(p & 0x80),
+                    'V': bool(p & 0x40),
+                    'B': bool(p & 0x10),
+                    'D': bool(p & 0x08),
+                    'I': bool(p & 0x04),
+                    'Z': bool(p & 0x02),
+                    'C': bool(p & 0x01),
+                }
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to debugger method
         if not self.in_debugger:
             self.enter_debugger()
 
@@ -642,6 +887,18 @@ class Emulator:
         Args:
             cold: If True, do a cold reset (full reboot). Otherwise warm reset.
         """
+        # Auto-resume if paused
+        self._ensure_running()
+
+        # Use control socket if available (much more reliable)
+        if self.control_socket:
+            try:
+                self.control_socket.reset(cold=cold)
+                return
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to debugger method
         if not self.in_debugger:
             self.enter_debugger()
 
@@ -665,7 +922,7 @@ class Emulator:
         return Path(filepath).exists()
 
     def wait_for_prompt(self, prompt: str = "]", timeout: float = 10.0) -> str:
-        """Wait for a specific prompt character.
+        """Wait for a specific prompt character at start of line.
 
         Args:
             prompt: Prompt character to wait for
@@ -678,7 +935,9 @@ class Emulator:
             self.exit_debugger()
 
         try:
-            self.process.expect(re.escape(prompt), timeout=timeout)
+            # Match prompt at start of line to avoid matching ] in other contexts
+            # Use exact string match for reliability
+            self.process.expect_exact('\n' + prompt, timeout=timeout)
             return self.process.before
         except pexpect.TIMEOUT:
             raise BobbinError(f"Timeout waiting for prompt '{prompt}'")
@@ -686,15 +945,26 @@ class Emulator:
     def run_basic_command(self, command: str, timeout: float = 30.0) -> str:
         """Type a BASIC command and wait for the prompt to return.
 
+        Uses stdin-based typing for reliable input, then waits and reads the screen.
+
         Args:
             command: BASIC command to execute
-            timeout: Maximum wait time
+            timeout: Maximum wait time for command to complete
 
         Returns:
-            Output from the command
+            Output from the command (screen contents)
         """
-        self.type_text(command, include_return=True)
-        return self.wait_for_prompt("]", timeout=timeout)
+        # Use stdin-based typing - more reliable than debugger injection
+        # because debugger entry via Ctrl-C can leak characters to Apple II
+        command = command.upper()
+        self.type_text(command, include_return=True, use_inject=False)
+
+        # Wait for command to complete and fully process
+        time.sleep(0.5)
+
+        # Read screen using the standard method
+        lines = self.read_screen()
+        return '\n'.join(line.rstrip() for line in lines).strip()
 
     def capture_hgr(self, filepath: str, page: int = 1,
                     format: str = "ppm", color: bool = False) -> bool:
@@ -712,6 +982,16 @@ class Emulator:
         if not self.is_running:
             raise BobbinError("Emulator not running")
 
+        # Use control socket if available (much more reliable)
+        # Note: control socket only supports PPM format
+        if self.control_socket and format == "ppm":
+            try:
+                result = self.control_socket.capture_hgr(filepath, page=page, color=color)
+                return 'path' in result
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to debugger method
         was_in_debugger = self.in_debugger
         if not was_in_debugger:
             self.enter_debugger()
@@ -747,6 +1027,16 @@ class Emulator:
         if not self.is_running:
             raise BobbinError("Emulator not running")
 
+        # Use control socket if available (much more reliable)
+        # Note: control socket only supports PPM format (scaled, not native)
+        if self.control_socket and format == "ppm" and not native:
+            try:
+                result = self.control_socket.capture_gr(filepath, page=page)
+                return 'path' in result
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to debugger method
         was_in_debugger = self.in_debugger
         if not was_in_debugger:
             self.enter_debugger()
@@ -784,6 +1074,16 @@ class Emulator:
         if not self.is_running:
             raise BobbinError("Emulator not running")
 
+        # Use control socket if available (much more reliable)
+        # Note: control socket only supports PPM format
+        if self.control_socket and format == "ppm":
+            try:
+                result = self.control_socket.capture_dhgr(filepath, page=page)
+                return 'path' in result
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to debugger method
         was_in_debugger = self.in_debugger
         if not was_in_debugger:
             self.enter_debugger()
@@ -820,6 +1120,16 @@ class Emulator:
         if not self.is_running:
             raise BobbinError("Emulator not running")
 
+        # Use control socket if available (much more reliable)
+        # Note: control socket only supports PPM format (scaled, not native)
+        if self.control_socket and format == "ppm" and not native:
+            try:
+                result = self.control_socket.capture_dgr(filepath, page=page)
+                return 'path' in result
+            except ControlSocketError as e:
+                raise BobbinError(f"Control socket error: {e}")
+
+        # Fall back to debugger method
         was_in_debugger = self.in_debugger
         if not was_in_debugger:
             self.enter_debugger()
@@ -839,3 +1149,47 @@ class Emulator:
             self.exit_debugger()
 
         return "Saved" in output
+
+    def save_state(self, filepath: str) -> dict:
+        """Save emulator state (CPU, 128KB RAM, soft switches) to a file.
+
+        Args:
+            filepath: Output file path
+
+        Returns:
+            Dict with ok=True on success, or error message
+        """
+        if not self.is_running:
+            raise BobbinError("Emulator not running")
+
+        # Requires control socket
+        if not self.control_socket:
+            return {"error": "Control socket not available"}
+
+        try:
+            return self.control_socket.save_state(filepath)
+        except ControlSocketError as e:
+            return {"error": str(e)}
+
+    def load_state(self, filepath: str) -> dict:
+        """Load emulator state from a file.
+
+        Instantly restores CPU, 128KB RAM, and soft switches.
+
+        Args:
+            filepath: State file to load
+
+        Returns:
+            Dict with ok=True and version on success, or error message
+        """
+        if not self.is_running:
+            raise BobbinError("Emulator not running")
+
+        # Requires control socket
+        if not self.control_socket:
+            return {"error": "Control socket not available"}
+
+        try:
+            return self.control_socket.load_state(filepath)
+        except ControlSocketError as e:
+            return {"error": str(e)}
